@@ -1,0 +1,10 @@
+.venv
+.env
+__pycache__
+database/
+modelos/
+graficos/
+resultados/
+__pycache__/
+*.pyc
+.venv/
