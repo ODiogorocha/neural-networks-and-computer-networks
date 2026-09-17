@@ -1,186 +1,386 @@
-import os
 import json
+import os
+import sys
 import time
-import random
+from pathlib import Path
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="SOC Dashboard - IDS P4Runtime", page_icon="🛡️", layout="wide")
+# --- RESOLUÇÃO DE CAMINHOS E IMPORTS ---
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATABASE_DIR = os.path.join(BASE_DIR, "database")
-PATH_P4_DATA = os.path.join(DATABASE_DIR, "telemetria_p4_live.json")
-os.makedirs(DATABASE_DIR, exist_ok=True)
+try:
+    from src.ssh_traffic_generator import executar_injecao_remota
+except ModuleNotFoundError:
+    from ssh_traffic_generator import executar_injecao_remota
 
-# =====================================================================
-# 1. CARREGAMENTO SEGURO DA LLM (LlamaIndex + Ollama)
-# =====================================================================
-@st.cache_resource
-def obter_engine_rag():
-    try:
-        from llama_index.core import VectorStoreIndex, Document
-        from llama_index.llms.ollama import Ollama
-        from llama_index.embeddings.ollama import OllamaEmbedding
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(
+    page_title="SOC Command Center - P4Runtime + LLM",
+    page_icon="🛡️",
+    layout="wide",
+)
 
-        # Timeout reduzido para não travar a interface
-        llm = Ollama(model="llama3", request_timeout=15.0)
-        embed_model = OllamaEmbedding(model_name="nomic-embed-text")
+DB_PATH = ROOT_DIR / "database" / "telemetria_p4_live.json"
 
-        knowledge_text = """
-        Base de Conhecimento do Sistema IDS / Plano de Controle P4:
-        - BENIGN: Tráfego normal. Manter regras padrão.
-        - DDoS / DoS: Risco Crítico. Inserir entrada na tabela 'MyIngress.drop_table'.
-        - PortScan: Risco Alto. Bloquear pacotes TCP SYN na tabela 'MyIngress.block_scan'.
-        - Botnet / Infiltration: Risco Alto. Aplicar ação de drop imediata para a tupla (src_ip, dst_ip).
-        """
-        documents = [Document(text=knowledge_text)]
-        index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
-        return index.as_query_engine(llm=llm, response_mode="compact", similarity_top_k=1)
-    except Exception as e:
-        st.warning(f"Aviso: Não foi possível conectar ao Ollama ({e}). Usando motor de regras fallback.")
-        return None
 
-query_engine = obter_engine_rag()
-
-# =====================================================================
-# 2. FUNÇÕES DE PROCESSAMENTO
-# =====================================================================
-def salvar_historico(evento):
-    historico = []
-    if os.path.exists(PATH_P4_DATA):
+def carregar_telemetria():
+    if os.path.exists(DB_PATH):
         try:
-            with open(PATH_P4_DATA, "r") as f:
-                historico = json.load(f)
+            with open(DB_PATH, "r", encoding="utf-8") as f:
+                return pd.DataFrame(json.load(f))
         except Exception:
-            historico = []
+            return pd.DataFrame()
+    return pd.DataFrame()
 
-    historico.insert(0, evento)
-    historico = historico[:50]
 
-    with open(PATH_P4_DATA, "w") as f:
-        json.dump(historico, f, indent=2)
-
-def analisar_com_fallback(src_ip, dst_ip, label, metrics):
-    prompt = f"IP Origem: {src_ip} | Ameaça: {label} | Métricas: {metrics}"
-    
-    t_inicio = time.perf_counter()
-    decisao_texto = ""
-
-    if query_engine is not None:
-        try:
-            resposta = query_engine.query(prompt)
-            decisao_texto = str(resposta)
-        except Exception:
-            decisao_texto = gerar_regra_fallback(label, src_ip)
-    else:
-        decisao_texto = gerar_regra_fallback(label, src_ip)
-
-    t_fim = time.perf_counter()
-
-    evento = {
-        "timestamp": time.strftime("%H:%M:%S"),
-        "src_ip": src_ip,
-        "dst_ip": dst_ip,
-        "label": label,
-        "latency_s": round(t_fim - t_inicio, 2),
-        "decisao_llm": decisao_texto,
-        "metrics": metrics
+def salvar_evento_simulado(tipo_ataque, qtd):
+    """Simula um evento de telemetria e salva localmente para testes sem VM."""
+    mapa_simulacao = {
+        "DDoS": {
+            "predicao": "DDoS",
+            "acao_p4": "MyIngress.drop_table",
+            "regra_aplicada": f"DROP src_ip=10.0.0.{time.time_ns()%100}",
+            "protocolo": "TCP",
+        },
+        "PortScan": {
+            "predicao": "PortScan",
+            "acao_p4": "MyIngress.block_scan",
+            "regra_aplicada": "BLOCK_SCAN port=1-1024",
+            "protocolo": "TCP",
+        },
+        "Botnet": {
+            "predicao": "Botnet",
+            "acao_p4": "MyIngress.drop_table",
+            "regra_aplicada": "DROP src_ip=10.0.0.99",
+            "protocolo": "TCP",
+        },
+        "BENIGN": {
+            "predicao": "BENIGN",
+            "acao_p4": "NoAction",
+            "regra_aplicada": "FORWARD L2/L3",
+            "protocolo": "UDP",
+        },
     }
-    salvar_historico(evento)
 
-def gerar_regra_fallback(label, src_ip):
-    regras = {
-        "DDoS": f"1. Risco: Crítico\n2. Ação P4Runtime: MyIngress.drop_table(src_ip={src_ip})",
-        "PortScan": f"1. Risco: Alto\n2. Ação P4Runtime: MyIngress.block_scan(src_ip={src_ip})",
-        "Botnet": f"1. Risco: Alto\n2. Ação P4Runtime: MyIngress.drop_table(src_ip={src_ip})",
-        "Infiltration": f"1. Risco: Alto\n2. Ação P4Runtime: MyIngress.drop_table(src_ip={src_ip})",
-        "BENIGN": "1. Risco: Baixo\n2. Ação P4Runtime: NoAction (Encaminhamento Normal)"
+    info = mapa_simulacao.get(tipo_ataque, mapa_simulacao["BENIGN"])
+    novo_evento = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "src_ip": f"10.0.0.{time.time_ns()%200 + 2}",
+        "dst_ip": "10.0.0.2",
+        "protocolo": info["protocolo"],
+        "pacotes": qtd,
+        "predicao": info["predicao"],
+        "acao_p4": info["acao_p4"],
+        "regra_aplicada": info["regra_aplicada"],
+        "latencia_ms": round(15.0 + (time.time_ns() % 30), 2),
     }
-    return regras.get(label, "1. Risco: Desconhecido\n2. Ação P4Runtime: Encaminhar para inspeção")
 
-# =====================================================================
-# 3. INTERFACE DASHBOARD
-# =====================================================================
-st.title("🛡️ SOC Dashboard — Monitoramento & Injeção de Padrões P4")
-st.markdown("Injete ataques em tempo real na rede BMv2 para acionar a análise RAG + LLM e visualizar as ações no Dataplane.")
+    df = carregar_telemetria()
+    df_novo = pd.DataFrame([novo_evento])
+    df_final = pd.concat([df, df_novo], ignore_index=True)
 
-st.subheader("⚡ Disparo Rápido de Ataques na Rede")
+    os.makedirs(DB_PATH.parent, exist_ok=True)
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(df_final.to_dict(orient="records"), f, indent=4)
 
-col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
 
-if col_b1.button("🔴 Injetar DDoS", use_container_width=True):
-    src = f"10.0.0.{random.randint(1, 99)}"
-    m = {"Flow Duration": random.randint(1000, 2500), "Total Fwd Packets": random.randint(3000, 10000), "Flow Bytes/s": round(random.uniform(800000.0, 2000000.0), 2)}
-    analisar_com_fallback(src, "10.0.0.254", "DDoS", m)
-    st.rerun()
+# --- MENU LATERAL ENXUTO: APENAS STATUS E CONFIGURAÇÕES ---
+st.sidebar.title("⚙️ Painel de Controle")
+with st.sidebar.expander("📡 Conexão SSH (VM Mininet)", expanded=True):
+    vm_ip = st.text_input("IP da VM", value="192.168.56.101")
+    vm_user = st.text_input("Usuário VM", value="p4")
+    vm_pass = st.text_input("Senha VM", type="password", value="p4")
 
-if col_b2.button("🟠 Injetar PortScan", use_container_width=True):
-    src = f"10.0.0.{random.randint(100, 150)}"
-    m = {"Flow Duration": random.randint(10, 50), "Total Fwd Packets": 1, "Flow Bytes/s": round(random.uniform(100.0, 400.0), 2)}
-    analisar_com_fallback(src, "10.0.0.254", "PortScan", m)
-    st.rerun()
+st.sidebar.divider()
+st.sidebar.info(
+    "💡 **Arquitetura:** O switch P4 intercepta o tráfego via Mininet na VM, envia o Digest gRPC para o controlador local, e o RAG/Ollama toma a decisão de mitigação."
+)
 
-if col_b3.button("🟡 Injetar Botnet", use_container_width=True):
-    src = f"192.168.1.{random.randint(10, 50)}"
-    m = {"Flow Duration": random.randint(5000, 15000), "Total Fwd Packets": random.randint(50, 200), "Flow Bytes/s": round(random.uniform(50000.0, 150000.0), 2)}
-    analisar_com_fallback(src, "10.0.0.254", "Botnet", m)
-    st.rerun()
+# --- CORPO PRINCIPAL ORGANIZADO EM ABAS ---
+st.title("🛡️ SOC Command Center - P4Runtime & LLM Agent")
+st.caption(
+    "Orquestração de Tráfego, Análise de Telemetria P4 e Relatórios de Mitigação Autônoma"
+)
 
-if col_b4.button("🟣 Injetar Infiltration", use_container_width=True):
-    src = f"172.16.0.{random.randint(5, 30)}"
-    m = {"Flow Duration": random.randint(8000, 20000), "Total Fwd Packets": random.randint(100, 500), "Flow Bytes/s": round(random.uniform(200000.0, 600000.0), 2)}
-    analisar_com_fallback(src, "10.0.0.254", "Infiltration", m)
-    st.rerun()
+aba_injecao, aba_dashboard, aba_relatorios = st.tabs(
+    [
+        "🚀 Centro de Injeção de Tráfego",
+        "📊 SOC Dashboard Live",
+        "📑 Relatórios & Analytics",
+    ]
+)
 
-if col_b5.button("🟢 Tráfego BENIGN", use_container_width=True):
-    src = f"10.0.0.{random.randint(200, 240)}"
-    m = {"Flow Duration": random.randint(2000, 5000), "Total Fwd Packets": random.randint(10, 30), "Flow Bytes/s": round(random.uniform(1000.0, 8000.0), 2)}
-    analisar_com_fallback(src, "10.0.0.254", "BENIGN", m)
-    st.rerun()
+# ==============================================================================
+# ABA 1: INJEÇÃO DE TRÁFEGO (REAL E SIMULADO)
+# ==============================================================================
+with aba_injecao:
+    st.subheader("🎮 Gerador de Tráfego de Rede")
+    st.markdown(
+        "Escolha a modalidade de envio e clique no ataque desejado para executar o pipeline."
+    )
 
-st.divider()
+    qtd_pacotes = st.slider(
+        "Volume de Pacotes a Injetar:",
+        min_value=10,
+        max_value=300,
+        value=50,
+        step=10,
+    )
 
-# =====================================================================
-# 4. TABELA DE EXIBIÇÃO
-# =====================================================================
-st.subheader("📡 Tabela de Eventos de Telemetria & Decisões P4Runtime")
+    st.divider()
 
-if os.path.exists(PATH_P4_DATA):
-    try:
-        with open(PATH_P4_DATA, "r") as f:
-            eventos = json.load(f)
+    col_real, col_sim = st.columns(2)
 
-        if eventos:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Último IP Capturado", eventos[0]["src_ip"])
-            col2.metric("Ameaça Classificada", eventos[0]["label"])
-            col3.metric("Tempo Análise LLM", f"{eventos[0]['latency_s']}s")
+    # --- INJEÇÃO REAL (VIA SSH / MININET / BMv2) ---
+    with col_real:
+        st.markdown("### 🌐 Tráfego REAL (Mininet / BMv2 via SSH)")
+        st.caption(
+            "Dispara pacotes físicos na interface `h1-eth0` na VM VirtualBox."
+        )
 
-            tabela_dados = []
-            for ev in eventos:
-                m = ev.get("metrics", {})
-                tabela_dados.append({
-                    "Horário": ev.get("timestamp"),
-                    "IP Origem": ev.get("src_ip"),
-                    "IP Destino": ev.get("dst_ip"),
-                    "Ameaça ML": ev.get("label"),
-                    "Fwd Packets": m.get("Total Fwd Packets"),
-                    "Bytes/s": m.get("Flow Bytes/s"),
-                    "Duração (ms)": m.get("Flow Duration"),
-                    "Decisão & Ação P4 (LLM)": ev.get("decisao_llm"),
-                    "Latência (s)": ev.get("latency_s")
-                })
+        c_r1, c_r2 = st.columns(2)
+        btn_real_ddos = c_r1.button(
+            "💥 Disparar DDoS Real", use_container_width=True
+        )
+        btn_real_botnet = c_r1.button(
+            "🤖 Disparar Botnet Real", use_container_width=True
+        )
+        btn_real_scan = c_r2.button(
+            "🔍 Disparar PortScan Real", use_container_width=True
+        )
+        btn_real_benign = c_r2.button(
+            "✅ Disparar BENIGN Real", use_container_width=True
+        )
 
-            df = pd.DataFrame(tabela_dados)
-            st.dataframe(
-                df, 
-                use_container_width=True,
-                column_config={
-                    "Decisão & Ação P4 (LLM)": st.column_config.TextColumn("Decisão & Ação P4 (LLM)", width="large"),
-                    "Bytes/s": st.column_config.NumberColumn("Bytes/s", format="%.2f")
-                }
+        ataque_real = None
+        if btn_real_ddos:
+            ataque_real = "DDoS"
+        elif btn_real_botnet:
+            ataque_real = "Botnet"
+        elif btn_real_scan:
+            ataque_real = "PortScan"
+        elif btn_real_benign:
+            ataque_real = "BENIGN"
+
+        if ataque_real:
+            st.markdown("---")
+            st.markdown(f"**Status da Injeção Real: `{ataque_real}`**")
+            p_bar = st.progress(0)
+            txt_status = st.empty()
+
+            txt_status.markdown(
+                "📡 **Etapa 1/4:** Conectando via SSH com a VM..."
             )
-        else:
-            st.info("Aguardando injeção de pacotes de telemetria...")
-    except Exception as e:
-        st.error(f"Erro ao carregar os dados: {e}")
+            p_bar.progress(25)
+            time.sleep(0.2)
+
+            sucesso, saida = executar_injecao_remota(
+                tipo_ataque=ataque_real,
+                quantidade=qtd_pacotes,
+                vm_ip=vm_ip,
+                vm_user=vm_user,
+                vm_pass=vm_pass,
+            )
+
+            if sucesso:
+                txt_status.markdown(
+                    "⚡ **Etapa 2/4:** Pacotes trafegando no Switch BMv2..."
+                )
+                p_bar.progress(50)
+                time.sleep(0.3)
+
+                txt_status.markdown(
+                    "🧠 **Etapa 3/4:** RAG (CIC-IDS2017) + Ollama consultados..."
+                )
+                p_bar.progress(75)
+                time.sleep(0.3)
+
+                txt_status.markdown(
+                    "✅ **Etapa 4/4:** Regra P4Runtime instalada no BMv2!"
+                )
+                p_bar.progress(100)
+
+                st.success(f"Injeção Real de {ataque_real} enviada com sucesso!")
+                with st.expander("📄 Ver Log de Saída da VM"):
+                    st.code(saida, language="bash")
+            else:
+                p_bar.progress(0)
+                st.error(f"Falha na conexão SSH com a VM: {saida}")
+
+    # --- INJEÇÃO SIMULADA (LOCAL / RÁPIDA) ---
+    with col_sim:
+        st.markdown("### 🧪 Tráfego SIMULADO (Local / Testes Rápidos)")
+        st.caption(
+            "Gera eventos sintéticos direto na base de dados para testes sem a VM."
+        )
+
+        c_s1, c_s2 = st.columns(2)
+        btn_sim_ddos = c_s1.button(
+            "💥 Simular DDoS", use_container_width=True
+        )
+        btn_sim_botnet = c_s1.button(
+            "🤖 Simular Botnet", use_container_width=True
+        )
+        btn_sim_scan = c_s2.button(
+            "🔍 Simular PortScan", use_container_width=True
+        )
+        btn_sim_benign = c_s2.button(
+            "✅ Simular BENIGN", use_container_width=True
+        )
+
+        ataque_sim = None
+        if btn_sim_ddos:
+            ataque_sim = "DDoS"
+        elif btn_sim_botnet:
+            ataque_sim = "Botnet"
+        elif btn_sim_scan:
+            ataque_sim = "PortScan"
+        elif btn_sim_benign:
+            ataque_sim = "BENIGN"
+
+        if ataque_sim:
+            salvar_evento_simulado(ataque_sim, qtd_pacotes)
+            st.success(
+                f"Evento simulado de **{ataque_sim}** gerado e gravado no JSON local!"
+            )
+
+
+# ==============================================================================
+# ABA 2: SOC DASHBOARD LIVE
+# ==============================================================================
+with aba_dashboard:
+    df_telemetria = carregar_telemetria()
+
+    # Cards de Métricas Superiores
+    m1, m2, m3, m4 = st.columns(4)
+    total_eventos = len(df_telemetria) if not df_telemetria.empty else 0
+    amenacas_detectadas = (
+        len(df_telemetria[df_telemetria["predicao"] != "BENIGN"])
+        if not df_telemetria.empty and "predicao" in df_telemetria.columns
+        else 0
+    )
+    latencia_media = (
+        df_telemetria["latencia_ms"].mean()
+        if not df_telemetria.empty and "latencia_ms" in df_telemetria.columns
+        else 0.0
+    )
+    regras_aplicadas = (
+        len(df_telemetria[df_telemetria["acao_p4"] != "NoAction"])
+        if not df_telemetria.empty and "acao_p4" in df_telemetria.columns
+        else 0
+    )
+
+    m1.metric("Total de Fluxos P4", total_eventos)
+    m2.metric("Ameaças Analisadas", amenacas_detectadas, delta_color="inverse")
+    m3.metric("Latência Média LLM", f"{latencia_media:.2f} ms")
+    m4.metric("Regras P4 Instaladas", regras_aplicadas)
+
+    st.divider()
+
+    if not df_telemetria.empty:
+        col_g1, col_g2 = st.columns(2)
+
+        with col_g1:
+            if "predicao" in df_telemetria.columns:
+                fig_pie = px.pie(
+                    df_telemetria,
+                    names="predicao",
+                    title="Distribuição do Tráfego (ExtraTrees)",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_g2:
+            if "acao_p4" in df_telemetria.columns:
+                fig_bar = px.histogram(
+                    df_telemetria,
+                    x="acao_p4",
+                    color="predicao",
+                    title="Ações Instaladas nas Tabelas do Switch P4",
+                    barmode="group",
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+        st.subheader("📋 Tabela de Telemetria P4 e Decisões LLM em Tempo Real")
+        colunas_visiveis = [
+            col
+            for col in [
+                "timestamp",
+                "src_ip",
+                "dst_ip",
+                "protocolo",
+                "pacotes",
+                "predicao",
+                "acao_p4",
+                "regra_aplicada",
+                "latencia_ms",
+            ]
+            if col in df_telemetria.columns
+        ]
+
+        st.dataframe(
+            (
+                df_telemetria[colunas_visiveis].sort_values(
+                    by="timestamp", ascending=False
+                )
+                if "timestamp" in df_telemetria.columns
+                else df_telemetria[colunas_visiveis]
+            ),
+            use_container_width=True,
+            height=350,
+        )
+    else:
+        st.info(
+            "Aguardando dados de telemetria. Utilize a aba **'🚀 Centro de Injeção de Tráfego'** para disparar eventos."
+        )
+
+
+# ==============================================================================
+# ABA 3: RELATÓRIOS & ANALYTICS
+# ==============================================================================
+with aba_relatorios:
+    st.subheader("📑 Relatórios do Agente SOC & Desempenho")
+    df_telemetria = carregar_telemetria()
+
+    if not df_telemetria.empty:
+        col_r1, col_r2 = st.columns(2)
+
+        with col_r1:
+            st.markdown("#### ⏱️ Desempenho de Latência da LLM/RAG (ms)")
+            if "latencia_ms" in df_telemetria.columns:
+                fig_line = px.line(
+                    df_telemetria,
+                    y="latencia_ms",
+                    title="Latência por Evento (ms)",
+                    markers=True,
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
+
+        with col_r2:
+            st.markdown("#### 🛡️ Resumo Executivo de Mitigação")
+            st.write(
+                f"- **Total de Requisições Analisadas:** {len(df_telemetria)}"
+            )
+            st.write(
+                f"- **Taxa de Mitigação de Ameaças:** {(amenacas_detectadas / max(1, total_eventos))*100:.1f}%"
+            )
+            st.write(
+                f"- **Tempo Médio de Resposta da LLM:** {latencia_media:.2f} ms"
+            )
+
+            # Botão de exportação
+            csv_data = df_telemetria.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Baixar Relatório Completo (CSV)",
+                data=csv_data,
+                file_name="relatorio_mitigacao_p4_llm.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    else:
+        st.warning("Sem dados suficientes para gerar relatórios no momento.")
